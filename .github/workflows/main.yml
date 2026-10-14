@@ -14,21 +14,685 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle 8.7 (Bypass GitHub Cache Outage)
+      - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
           cache-disabled: true
 
-      - name: Verify Project Files & Compile Debug APK
-     run: |
-       ls -laR
-       gradle assembleDebug -Pandroid.useAndroidX=true -Pandroid.enableJetifier=true --no-daemon --stacktrace
+      - name: Ensure Exact Project Structure & AndroidX Config
+        run: |
+          echo "android.useAndroidX=true" > gradle.properties
+          echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> gradle.properties
+          mkdir -p app/src/main/java/com/pulseeq/audio
+          
+          # If files were uploaded flat or nested, ensure all 6 source files exist in exact paths:
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PulseEQ"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.pulseeq.audio"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.pulseeq.audio"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+          }
+
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+              implementation(composeBom)
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.foundation:foundation")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="PulseEQ Engine"
+                  android:icon="@android:drawable/ic_lock_silent_mode_off"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".EqForegroundService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/pulseeq/audio/EqForegroundService.kt
+          package com.pulseeq.audio
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.media.AudioDeviceCallback
+          import android.media.AudioDeviceInfo
+          import android.media.AudioManager
+          import android.media.audiofx.AudioEffect
+          import android.media.audiofx.DynamicsProcessing
+          import android.os.Binder
+          import android.os.Build
+          import android.os.IBinder
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+
+          data class EqState(
+              val isEnabled: Boolean = true,
+              val preampDb: Float = -1.5f,
+              val limiterEnabled: Boolean = true,
+              val autoSwitchHardware: Boolean = true,
+              val activePreset: String = "7Hz Zero:2 (Harman)",
+              val connectedDevice: String = "Speaker / Default",
+              val bandGains: List<Float> = listOf(2.5f, 1.8f, 0.5f, -0.8f, -0.5f, 0.2f, 1.5f, 2.2f, 1.0f, 1.8f)
+          )
+
+          class EqForegroundService : Service() {
+
+              private val binder = LocalBinder()
+              private val _state = MutableStateFlow(EqState())
+              val state = _state.asStateFlow()
+
+              private val activeEffects = mutableMapOf<Int, DynamicsProcessing>()
+              private lateinit var audioManager: AudioManager
+
+              companion object {
+                  val FREQUENCIES = floatArrayOf(
+                      31.25f, 62.5f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f
+                  )
+
+                  val PRESETS = mapOf(
+                      "7Hz Zero:2 (Harman)" to listOf(2.5f, 1.8f, 0.5f, -0.8f, -0.5f, 0.2f, 1.5f, 2.2f, 1.0f, 1.8f),
+                      "AirPods Pro 2 (Warm)" to listOf(3.0f, 2.5f, 1.2f, 0.0f, -0.5f, 0.5f, 1.2f, 1.8f, 2.5f, 2.0f),
+                      "Organic & Deep House" to listOf(4.2f, 3.8f, 2.0f, -1.2f, -1.5f, 0.0f, 1.5f, 2.8f, 3.5f, 3.0f),
+                      "Competitive Footsteps" to listOf(-6.0f, -4.5f, -2.0f, 1.5f, 3.0f, 4.5f, 5.5f, 4.0f, 1.0f, -2.0f),
+                      "Flat Reference" to listOf(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
+                  )
+              }
+
+              inner class LocalBinder : Binder() {
+                  fun getService(): EqForegroundService = this@EqForegroundService
+              }
+
+              private val audioSessionReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      val sessionId = intent?.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, 0) ?: 0
+                      when (intent?.action) {
+                          AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION -> attachDspToSession(sessionId)
+                          AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION -> releaseSession(sessionId)
+                      }
+                  }
+              }
+
+              private val deviceCallback = object : AudioDeviceCallback() {
+                  override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+                      evaluateConnectedHardware()
+                  }
+                  override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+                      evaluateConnectedHardware()
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  startForegroundNotification()
+
+                  val filter = IntentFilter().apply {
+                      addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+                      addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      registerReceiver(audioSessionReceiver, filter, Context.RECEIVER_EXPORTED)
+                  } else {
+                      registerReceiver(audioSessionReceiver, filter)
+                  }
+
+                  audioManager.registerAudioDeviceCallback(deviceCallback, null)
+                  attachDspToSession(0)
+                  evaluateConnectedHardware()
+              }
+
+              private fun evaluateConnectedHardware() {
+                  val outputs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                  var detectedName = "Phone Speaker"
+                  var autoPreset: String? = null
+
+                  for (dev in outputs) {
+                      when (dev.type) {
+                          AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                          AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+                          AudioDeviceInfo.TYPE_USB_HEADSET,
+                          AudioDeviceInfo.TYPE_USB_DEVICE -> {
+                              detectedName = "Wired IEM / USB DAC"
+                              autoPreset = "7Hz Zero:2 (Harman)"
+                              break
+                          }
+                          AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+                          AudioDeviceInfo.TYPE_BLE_HEADSET -> {
+                              detectedName = "Bluetooth Audio (${dev.productName})"
+                              autoPreset = "AirPods Pro 2 (Warm)"
+                          }
+                      }
+                  }
+
+                  _state.value = _state.value.copy(connectedDevice = detectedName)
+                  if (_state.value.autoSwitchHardware && autoPreset != null) {
+                      applyPreset(autoPreset)
+                  }
+              }
+
+              private fun attachDspToSession(sessionId: Int) {
+                  if (activeEffects.containsKey(sessionId)) return
+                  try {
+                      val config = DynamicsProcessing.Config.Builder(
+                          DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+                          1,
+                          true, FREQUENCIES.size,
+                          false, 0,
+                          true, FREQUENCIES.size,
+                          true
+                      ).build()
+
+                      val dp = DynamicsProcessing(0, sessionId, config)
+                      dp.enabled = _state.value.isEnabled
+                      activeEffects[sessionId] = dp
+                      syncDspHardware()
+                  } catch (_: Exception) {}
+              }
+
+              private fun releaseSession(sessionId: Int) {
+                  if (sessionId == 0) return
+                  activeEffects.remove(sessionId)?.release()
+              }
+
+              private fun syncDspHardware() {
+                  val current = _state.value
+                  val limiter = DynamicsProcessing.Limiter(
+                      true, current.limiterEnabled, 0,
+                      1.0f, 60.0f, 10.0f, -0.2f, 0.0f
+                  )
+
+                  activeEffects.values.forEach { dp ->
+                      try {
+                          dp.enabled = current.isEnabled
+                          dp.setInputGainAllChannelsTo(current.preampDb)
+                          dp.setLimiterAllChannelsTo(limiter)
+
+                          FREQUENCIES.forEachIndexed { index, freq ->
+                              val band = DynamicsProcessing.EqBand(true, freq, current.bandGains[index])
+                              dp.setPreEqBandAllChannelsTo(index, band)
+                              dp.setPostEqBandAllChannelsTo(index, DynamicsProcessing.EqBand(true, freq, 0f))
+                          }
+                      } catch (_: Exception) {}
+                  }
+              }
+
+              fun toggleMaster(enabled: Boolean) {
+                  _state.value = _state.value.copy(isEnabled = enabled)
+                  syncDspHardware()
+              }
+
+              fun setPreamp(db: Float) {
+                  _state.value = _state.value.copy(preampDb = db)
+                  syncDspHardware()
+              }
+
+              fun setBandGain(index: Int, gainDb: Float) {
+                  val updated = _state.value.bandGains.toMutableList()
+                  updated[index] = gainDb
+                  _state.value = _state.value.copy(bandGains = updated, activePreset = "Custom Curve")
+                  syncDspHardware()
+              }
+
+              fun applyPreset(name: String) {
+                  val gains = PRESETS[name] ?: return
+                  val maxBoost = gains.maxOrNull() ?: 0f
+                  val safePreamp = if (maxBoost > 0f) -maxBoost else 0f
+                  _state.value = _state.value.copy(
+                      bandGains = gains,
+                      activePreset = name,
+                      preampDb = safePreamp.coerceIn(-12f, 6f)
+                  )
+                  syncDspHardware()
+              }
+
+              fun toggleLimiter(enabled: Boolean) {
+                  _state.value = _state.value.copy(limiterEnabled = enabled)
+                  syncDspHardware()
+              }
+
+              fun toggleAutoSwitch(enabled: Boolean) {
+                  _state.value = _state.value.copy(autoSwitchHardware = enabled)
+              }
+
+              private fun startForegroundNotification() {
+                  val channelId = "pulseeq_dsp_channel"
+                  val manager = getSystemService(NotificationManager::class.java)
+                  val channel = NotificationChannel(
+                      channelId,
+                      "PulseEQ Hardware Engine",
+                      NotificationManager.IMPORTANCE_LOW
+                  )
+                  manager.createNotificationChannel(channel)
+
+                  val pendingIntent = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+
+                  val notification = Notification.Builder(this, channelId)
+                      .setContentTitle("PulseEQ DSP Active")
+                      .setContentText("10-Band Parametric Engine Running")
+                      .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
+                      .setContentIntent(pendingIntent)
+                      .setOngoing(true)
+                      .build()
+
+                  startForeground(101, notification)
+              }
+
+              override fun onBind(intent: Intent?): IBinder = binder
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  unregisterReceiver(audioSessionReceiver)
+                  audioManager.unregisterAudioDeviceCallback(deviceCallback)
+                  activeEffects.values.forEach { it.release() }
+                  activeEffects.clear()
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/pulseeq/audio/MainActivity.kt
+          package com.pulseeq.audio
+
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.ServiceConnection
+          import android.os.Bundle
+          import android.os.IBinder
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Path
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlin.math.roundToInt
+
+          class MainActivity : ComponentActivity() {
+
+              private var eqService by mutableStateOf<EqForegroundService?>(null)
+
+              private val connection = object : ServiceConnection {
+                  override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                      val binder = service as EqForegroundService.LocalBinder
+                      eqService = binder.getService()
+                  }
+                  override fun onServiceDisconnected(name: ComponentName?) {
+                      eqService = null
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val serviceIntent = Intent(this, EqForegroundService::class.java)
+                  startForegroundService(serviceIntent)
+                  bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
+
+                  setContent {
+                      MaterialTheme(
+                          colorScheme = darkColorScheme(
+                              primary = Color(0xFFFF9E44),
+                              secondary = Color(0xFF38BDF8),
+                              background = Color(0xFF0B0D12),
+                              surface = Color(0xFF151922)
+                          )
+                      ) {
+                          val service = eqService
+                          if (service != null) {
+                              val state by service.state.collectAsState()
+                              PulseEqScreen(state = state, service = service)
+                          } else {
+                              Box(Modifier.fillMaxSize().background(Color(0xFF0B0D12)), contentAlignment = Alignment.Center) {
+                                  Text("Initializing Hardware DSP...", color = Color.White)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  unbindService(connection)
+              }
+          }
+
+          @Composable
+          fun PulseEqScreen(state: EqState, service: EqForegroundService) {
+              val freqLabels = listOf("31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k")
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .background(Color(0xFF0B0D12))
+                      .verticalScroll(rememberScrollState())
+                      .padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp)
+              ) {
+                  Row(
+                      modifier = Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column {
+                          Text("PULSE EQ // DSP", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                          Text(
+                              text = "Output: ${state.connectedDevice}",
+                              color = Color(0xFF38BDF8),
+                              fontSize = 12.sp
+                          )
+                      }
+                      Switch(
+                          checked = state.isEnabled,
+                          onCheckedChange = { service.toggleMaster(it) }
+                      )
+                  }
+
+                  Box(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .height(155.dp)
+                          .clip(RoundedCornerShape(14.dp))
+                          .background(Color(0xFF131720))
+                          .border(1.dp, Color(0xFF262D3D), RoundedCornerShape(14.dp))
+                          .padding(12.dp)
+                  ) {
+                      FrequencyCurveCanvas(gains = state.bandGains, enabled = state.isEnabled)
+                      Text(
+                          text = "${state.activePreset}  |  Preamp: ${String.format("%.1f", state.preampDb)} dB",
+                          color = Color(0xFF94A3B8),
+                          fontSize = 11.sp,
+                          modifier = Modifier.align(Alignment.TopEnd)
+                      )
+                  }
+
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .horizontalScroll(rememberScrollState()),
+                      horizontalArrangement = Arrangement.spacedBy(8.dp)
+                  ) {
+                      EqForegroundService.PRESETS.keys.forEach { presetName ->
+                          val selected = state.activePreset == presetName
+                          Box(
+                              modifier = Modifier
+                                  .clip(RoundedCornerShape(20.dp))
+                                  .background(if (selected) Color(0xFFFF9E44) else Color(0xFF1A202C))
+                                  .clickable { service.applyPreset(presetName) }
+                                  .padding(horizontal = 14.dp, vertical = 8.dp)
+                          ) {
+                              Text(
+                                  text = presetName,
+                                  color = if (selected) Color.Black else Color.White,
+                                  fontSize = 12.sp,
+                                  fontWeight = FontWeight.SemiBold
+                              )
+                          }
+                      }
+                  }
+
+                  Column(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Color(0xFF151922))
+                          .padding(12.dp)
+                  ) {
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                          Text("Pre-Amplifier Headroom", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                          Text("${String.format("%.1f", state.preampDb)} dB", color = Color(0xFFFF9E44), fontSize = 13.sp)
+                      }
+                      Slider(
+                          value = state.preampDb,
+                          onValueChange = { service.setPreamp(it) },
+                          valueRange = -12f..6f
+                      )
+                  }
+
+                  Column(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Color(0xFF151922))
+                          .padding(12.dp),
+                      verticalArrangement = Arrangement.spacedBy(6.dp)
+                  ) {
+                      Text("10-Band Hardware Filter Bank (-12dB to +12dB)", color = Color(0xFF94A3B8), fontSize = 12.sp)
+
+                      state.bandGains.forEachIndexed { index, gain ->
+                          Row(
+                              modifier = Modifier.fillMaxWidth(),
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Text(
+                                  text = "${freqLabels[index]} Hz",
+                                  color = Color.White,
+                                  fontSize = 12.sp,
+                                  modifier = Modifier.width(52.dp)
+                              )
+                              Slider(
+                                  value = gain,
+                                  onValueChange = { service.setBandGain(index, (it * 10f).roundToInt() / 10f) },
+                                  valueRange = -12f..12f,
+                                  modifier = Modifier.weight(1f)
+                              )
+                              Text(
+                                  text = "${if (gain >= 0) "+" else ""}${String.format("%.1f", gain)}",
+                                  color = if (gain != 0f) Color(0xFFFF9E44) else Color.Gray,
+                                  fontSize = 12.sp,
+                                  modifier = Modifier.width(44.dp)
+                              )
+                          }
+                      }
+                  }
+
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Color(0xFF151922))
+                          .padding(12.dp),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column {
+                          Text("Brickwall Anti-Clip Limiter", color = Color.White, fontSize = 13.sp)
+                          Text("Prevents distortion on heavy sub-bass drops", color = Color.Gray, fontSize = 11.sp)
+                      }
+                      Switch(checked = state.limiterEnabled, onCheckedChange = { service.toggleLimiter(it) })
+                  }
+
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(12.dp))
+                          .background(Color(0xFF151922))
+                          .padding(12.dp),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column {
+                          Text("Auto-Detect IEM vs Bluetooth", color = Color.White, fontSize = 13.sp)
+                          Text("Switches preset when DAC/Headset plugs in", color = Color.Gray, fontSize = 11.sp)
+                      }
+                      Switch(checked = state.autoSwitchHardware, onCheckedChange = { service.toggleAutoSwitch(it) })
+                  }
+              }
+          }
+
+          @Composable
+          fun FrequencyCurveCanvas(gains: List<Float>, enabled: Boolean) {
+              Canvas(modifier = Modifier.fillMaxSize()) {
+                  val w = size.width
+                  val h = size.height
+                  val midY = h / 2f
+
+                  drawLine(
+                      color = Color(0xFF2A3244),
+                      start = Offset(0f, midY),
+                      end = Offset(w, midY),
+                      strokeWidth = 2f
+                  )
+
+                  val points = gains.mapIndexed { idx, gain ->
+                      val x = (idx.toFloat() / (gains.size - 1)) * w
+                      val normalizedY = midY - ((gain / 15f) * (h / 2f))
+                      Offset(x, normalizedY.coerceIn(8f, h - 8f))
+                  }
+
+                  val path = Path().apply {
+                      if (points.isNotEmpty()) {
+                          moveTo(points.first().x, points.first().y)
+                          for (i in 0 until points.size - 1) {
+                              val p0 = points[i]
+                              val p1 = points[i + 1]
+                              val controlX = (p0.x + p1.x) / 2f
+                              cubicTo(controlX, p0.y, controlX, p1.y, p1.x, p1.y)
+                          }
+                      }
+                  }
+
+                  val lineColor = if (enabled) Color(0xFFFF9E44) else Color.Gray
+                  drawPath(path = path, color = lineColor, style = Stroke(width = 5f))
+
+                  val fillPath = Path().apply {
+                      addPath(path)
+                      lineTo(w, h)
+                      lineTo(0f, h)
+                      close()
+                  }
+                  drawPath(
+                      path = fillPath,
+                      brush = Brush.verticalGradient(
+                          colors = listOf(lineColor.copy(alpha = 0.32f), Color.Transparent)
+                      )
+                  )
+              }
+          }
+          EOF
+
+          gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
