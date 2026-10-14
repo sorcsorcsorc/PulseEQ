@@ -31,7 +31,6 @@ jobs:
           echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8" >> gradle.properties
           mkdir -p app/src/main/java/com/pulseeq/audio
           
-          # If files were uploaded flat or nested, ensure all 6 source files exist in exact paths:
           cat << 'EOF' > settings.gradle.kts
           pluginManagement {
               repositories {
@@ -173,9 +172,9 @@ jobs:
               val preampDb: Float = -1.5f,
               val limiterEnabled: Boolean = true,
               val autoSwitchHardware: Boolean = true,
-              val activePreset: String = "7Hz Zero:2 (Harman)",
+              val activePreset: String = "Moondrop Chu 2",
               val connectedDevice: String = "Speaker / Default",
-              val bandGains: List<Float> = listOf(2.5f, 1.8f, 0.5f, -0.8f, -0.5f, 0.2f, 1.5f, 2.2f, 1.0f, 1.8f)
+              val bandGains: List<Float> = listOf(3.2f, 2.8f, 1.0f, -0.5f, -1.2f, 0.8f, 2.0f, 1.5f, 0.5f, 1.2f)
           )
 
           class EqForegroundService : Service() {
@@ -193,6 +192,7 @@ jobs:
                   )
 
                   val PRESETS = mapOf(
+                      "Moondrop Chu 2" to listOf(3.2f, 2.8f, 1.0f, -0.5f, -1.2f, 0.8f, 2.0f, 1.5f, 0.5f, 1.2f),
                       "7Hz Zero:2 (Harman)" to listOf(2.5f, 1.8f, 0.5f, -0.8f, -0.5f, 0.2f, 1.5f, 2.2f, 1.0f, 1.8f),
                       "AirPods Pro 2 (Warm)" to listOf(3.0f, 2.5f, 1.2f, 0.0f, -0.5f, 0.5f, 1.2f, 1.8f, 2.5f, 2.0f),
                       "Organic & Deep House" to listOf(4.2f, 3.8f, 2.0f, -1.2f, -1.5f, 0.0f, 1.5f, 2.8f, 3.5f, 3.0f),
@@ -256,7 +256,7 @@ jobs:
                           AudioDeviceInfo.TYPE_USB_HEADSET,
                           AudioDeviceInfo.TYPE_USB_DEVICE -> {
                               detectedName = "Wired IEM / USB DAC"
-                              autoPreset = "7Hz Zero:2 (Harman)"
+                              autoPreset = "Moondrop Chu 2"
                               break
                           }
                           AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
