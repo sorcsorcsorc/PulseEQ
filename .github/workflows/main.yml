@@ -26,9 +26,9 @@ jobs:
           cache-disabled: true
 
       - name: Verify Project Files & Compile Debug APK
-        run: |
-          ls -laR
-          gradle assembleDebug --no-daemon --stacktrace
+     run: |
+       ls -laR
+       gradle assembleDebug -Pandroid.useAndroidX=true -Pandroid.enableJetifier=true --no-daemon --stacktrace
 
       - name: Upload Compiled APK Artifact
         uses: actions/upload-artifact@v4
